@@ -3,5 +3,8 @@ This is my project
 Code line 1
 Code line 2
 
-Code line 3
+this is for conflict**
 Code line 4
+
+Code line 5
+code line 6
