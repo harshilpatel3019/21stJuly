@@ -2,7 +2,9 @@
 //|                                               DailyProfitEMA.mq5 |
 //|        EMA 21/55 crossover intraday EA with daily profit booking |
 //|                                                                  |
-//|  - Trades EURUSD, GBPUSD, GBPJPY from a single chart (H1)        |
+//|  - Trades the symbol of the chart it is attached to (H1); a     |
+//|    comma-separated list can be set to trade several from one    |
+//|    chart instead                                                 |
 //|  - Enters when EMA(21) crosses EMA(55), intrabar or on close     |
 //|  - No per-trade SL/TP by default: books ALL trades and halts for |
 //|    the day once floating profit reaches the daily $ target       |
@@ -19,7 +21,7 @@
 #include <Trade/Trade.mqh>
 
 input group "=== Strategy ==="
-input string          InpSymbols          = "EURUSD,GBPUSD,GBPJPY"; // Symbols (comma separated)
+input string          InpSymbols          = "";                     // Symbols (comma separated; empty = chart symbol)
 input ENUM_TIMEFRAMES InpTF               = PERIOD_H1;              // Signal timeframe
 input int             InpFastEMA          = 21;                     // Fast EMA period
 input int             InpSlowEMA          = 55;                     // Slow EMA period
@@ -73,8 +75,14 @@ string GVName(const string suffix) { return "DPEA_" + (string)InpMagic + "_" + s
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   string syms = InpSymbols;
+   StringTrimLeft(syms);
+   StringTrimRight(syms);
+   if(syms == "")
+      syms = _Symbol;   // blank input: trade the chart's own symbol
+
    string parts[];
-   int n = StringSplit(InpSymbols, ',', parts);
+   int n = StringSplit(syms, ',', parts);
    if(n <= 0)
    {
       Print("DailyProfitEMA: no symbols configured");

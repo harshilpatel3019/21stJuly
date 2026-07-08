@@ -1,8 +1,10 @@
 # DailyProfitEMA — EMA 21/55 intraday EA with daily profit booking
 
-An MetaTrader 5 Expert Advisor that trades **EURUSD, GBPUSD and GBPJPY** from a
-single chart on **H1**, enters on **EMA(21) / EMA(55) crossovers**, and manages
-the account like an intraday prop trader:
+A MetaTrader 5 Expert Advisor that trades **the symbol of the chart it is
+attached to** (attach it to EURUSD, GBPUSD, GBPJPY — any pair — on **H1**),
+enters on **EMA(21) / EMA(55) crossovers**, and manages the account like an
+intraday prop trader. Optionally, a comma-separated symbol list input lets one
+chart instance trade several pairs at once.
 
 - **Books profit for the day** — once the **combined floating profit** of the
   open trades reaches the daily target (default **$1,200**), every position is
@@ -48,11 +50,17 @@ on top of an in-flight cycle whose lot-sequence state was lost in the restart.
 
 1. Open MetaEditor (F4 from MT5), copy `Experts/DailyProfitEMA.mq5` into your
    terminal's `MQL5/Experts/` folder, and compile (F7).
-2. Make sure EURUSD, GBPUSD and GBPJPY are visible in Market Watch.
-3. Attach the EA to **any one** H1 chart (e.g. EURUSD H1) — it trades all
-   three symbols from that single chart. Do not attach it to multiple charts
-   with the same magic number.
-4. Enable Algo Trading.
+2. Attach the EA to the H1 chart of each pair you want traded (e.g. EURUSD
+   H1) — with `InpSymbols` left blank it trades that chart's symbol only.
+3. Enable Algo Trading.
+
+**Attaching to multiple charts:** instances sharing the same magic number act
+as **one basket** — the $1,200 floating target sums across all of them, and
+whichever instance reaches it books *everything* and halts them all for the
+day. Give each chart a **different magic number** if you want each pair to
+have its own independent $1,200 target and lot sequence. Note that with a
+shared magic, attaching to a new chart while other charts hold open trades
+also engages the startup lock on that new instance until those trades close.
 
 ## Backtesting (do this before any live money)
 
@@ -69,7 +77,7 @@ In the MT5 Strategy Tester:
 
 | Input | Default | Meaning |
 |---|---|---|
-| `InpSymbols` | EURUSD,GBPUSD,GBPJPY | Traded symbols (comma separated) |
+| `InpSymbols` | *(blank)* | Blank = trade the chart's own symbol; or a comma-separated list (e.g. `EURUSD,GBPUSD,GBPJPY`) to trade several from one chart |
 | `InpTF` | H1 | Signal timeframe |
 | `InpFastEMA` / `InpSlowEMA` | 21 / 55 | EMA periods |
 | `InpIntrabar` | true | React to crosses on the open candle |
