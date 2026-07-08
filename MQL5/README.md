@@ -22,6 +22,9 @@ pair you want; it trades that chart's symbol). It runs self-contained
    floating P/L** of the cycle reaches **+$1,200**, ALL positions are closed
    and the EA waits for the next band entry. No lot cap by default
    (`InpMaxLot` = 0), no trend filter.
+5. **Intraday** — everything is flattened at end of day (default 22:00
+   server time) and no new cycle is seeded at/after 20:00, so nothing is
+   held overnight.
 
 ## Restart behaviour
 
@@ -52,7 +55,8 @@ still books the basket at the target but places no new trades until flat.
 | `InpFlipMult` | 1.5 | Running-lot multiplier on each direction flip |
 | `InpMaxLot` | 0 | Lot cap per trade (0 = none, per spec) |
 | `InpBasketTP` | 1200 | Floating P/L ($) at which the whole cycle is booked |
-| `InpFlattenAtEOD` / `InpFlattenHour` | false / 22 | Optional end-of-day close-all (off: cycles usually span days) |
+| `InpFlattenAtEOD` / `InpFlattenHour` | true / 22 | End-of-day close-all (intraday operation) |
+| `InpSeedEndHour` | 20 | No new cycles seeded at/after this hour |
 | `InpMagic` | 21550708 | Magic number (EA only touches its own trades on its own symbol) |
 
 ## Backtesting
@@ -70,12 +74,17 @@ the ranges.
   lot by 1.5; a long choppy range flips constantly (×1.5¹⁰ ≈ ×57, ×1.5²⁰ ≈
   ×3,325 of the seed lot). With **no SL, no lot cap and no loss limit**, the
   only hard floor is the broker's margin call.
-- **The $1,200 basket target is far away from a 0.01 seed.** A clean 200-pip
-  one-way run with 20-pip grid adds earns on the order of tens of dollars,
-  not $1,200 — cycles will either run for a very long time, or reach the
-  target only after the running lot has grown large (i.e. after surviving
-  deep drawdown). Consider testing smaller basket targets (e.g. $12–$50 per
-  0.01 seed) or a larger seed lot, and scale from what the tester shows.
+- **The $1,200 basket target is far away from a 0.01 seed — especially
+  intraday.** A clean 200-pip one-way run with 20-pip grid adds earns on the
+  order of tens of dollars, not $1,200, and a cycle now only lives until the
+  end-of-day flatten. Expect most days to end with the basket closed at
+  whatever its floating P/L happens to be (often negative in ranges) rather
+  than at the target. Consider testing smaller basket targets (e.g. $12–$50
+  per 0.01 seed) or a larger seed lot, and scale from what the tester shows.
+- **The end-of-day flatten *realises* the cycle's floating P/L.** Intraday
+  operation caps overnight risk, but it also converts every unfinished
+  cycle's drawdown into a booked loss at 22:00 — watch the daily P/L
+  distribution in the tester, not just the equity curve.
 - Both seed legs open together, so one of them is always immediately losing;
   the cycle's floating P/L starts near zero minus spread.
 - All hour-based inputs use **broker server time**.

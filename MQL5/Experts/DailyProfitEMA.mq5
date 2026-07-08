@@ -15,13 +15,15 @@
 //|  4. EXIT: no per-trade SL/TP. When the combined floating P/L of  |
 //|     the cycle reaches the basket target, ALL positions close and |
 //|     the EA waits for the next band entry.                        |
+//|  5. INTRADAY: everything is flattened at end of day and no new   |
+//|     cycle is seeded in the late session; nothing held overnight. |
 //|                                                                  |
 //|  Cycle state persists in terminal global variables, so a restart |
 //|  resumes the running cycle. If positions exist but the saved     |
 //|  state is missing, the EA manages exits only (no new trades)     |
 //|  until flat.                                                     |
 //+------------------------------------------------------------------+
-#property version     "2.00"
+#property version     "2.10"
 #property description "Seeds 1 BUY + 1 SELL when an H1 candle closes with its"
 #property description "open/close between EMA21 and EMA55. Grid-adds with the"
 #property description "move every fixed $ step, running lot x1.5 on each flip,"
@@ -46,9 +48,12 @@ input double          InpMaxLot         = 0.0;       // Lot cap (0 = none)
 input group "=== Basket exit ==="
 input double          InpBasketTP       = 1200.0;    // Close ALL at this floating P/L ($)
 
-input group "=== Misc ==="
-input bool            InpFlattenAtEOD   = false;     // Close everything at end of day
+input group "=== Intraday ==="
+input bool            InpFlattenAtEOD   = true;      // Close everything at end of day
 input int             InpFlattenHour    = 22;        // End-of-day flatten hour (server time)
+input int             InpSeedEndHour    = 20;        // No new cycles at/after this hour (server time)
+
+input group "=== Misc ==="
 input long            InpMagic          = 21550708;  // Magic number
 
 CTrade   g_trade;
@@ -148,8 +153,8 @@ void DoWork()
       positions = 0;
    }
 
-   // Optional end-of-day flatten (off by default: grid cycles usually
-   // span days and flattening realises the drawdown).
+   // Intraday: flatten everything at end of day. Note this realises
+   // whatever floating P/L the cycle carries at that moment.
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    bool eod = InpFlattenAtEOD && dt.hour >= InpFlattenHour;
@@ -175,7 +180,8 @@ void DoWork()
    {
       if(g_cycleActive)
          EndCycle();          // closed externally (manually or by broker)
-      TrySeed();
+      if(dt.hour < InpSeedEndHour)
+         TrySeed();           // no fresh cycles in the late session
       return;
    }
 
