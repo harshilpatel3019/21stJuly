@@ -7,9 +7,12 @@ the account like an intraday prop trader:
 - **Books profit for the day** — once the account is up the daily target
   (default **$1,200**), every position is closed and no new trade is opened
   until the next day.
-- **Daily max loss** — once the account is down the daily loss limit
-  (default **$600**), it also stops for the day. The 2:1 target/loss asymmetry
-  is what keeps the daily-target approach survivable.
+- **Progressive lot sizing** — sequences start at **0.01**, grow by a step
+  while the trend keeps paying, and a reversal trade opens at **double** the
+  previous trade's lot.
+- **No daily loss limit** — the EA does not halt on drawdown, so the full
+  floating swing of a cycle is visible. The only per-position protection is
+  the ATR stop loss and the hard lot cap.
 - **Goes flat at end of day** (default 22:00 server time) — it is an intraday
   bot and holds nothing overnight.
 
@@ -21,7 +24,7 @@ the account like an intraday prop trader:
 | Sell | EMA(21) crosses **below** EMA(55) |
 | Signal timing | By default reacts **intrabar** (on the forming H1 candle, per tick). Set `InpIntrabar=false` to only act on closed candles. |
 | Exit | Fixed SL at `1.5 × ATR(14)`, TP at `2 × SL distance`, plus close on the opposite cross. |
-| Position size | Risk-based: hitting the SL loses `InpRiskPercent` (default 0.5%) of equity. Lot size adapts per symbol (handles GBPJPY's different pip value automatically). |
+| Position size | Progressive sequence per symbol: first trade `0.01`; a same-direction re-entry (after a TP/SL exit while the trend persists, max one per H1 bar) adds `InpLotStep` (default 0.01); a reversal trade multiplies the last lot by `InpReverseMult` (default 2×). Capped at `InpMaxLot`; sequence restarts at the base lot each day. |
 | Concurrency | One position per symbol, max 3 total. |
 | Session | New entries only between 07:00–20:00 server time by default. |
 
@@ -63,9 +66,13 @@ In the MT5 Strategy Tester:
 | `InpFastEMA` / `InpSlowEMA` | 21 / 55 | EMA periods |
 | `InpIntrabar` | true | React to crosses on the open candle |
 | `InpDailyTarget` | 1200 | Daily profit ($) at which everything is closed and trading stops |
-| `InpDailyMaxLoss` | 600 | Daily loss ($) at which trading stops |
 | `InpFlattenAtEOD` / `InpFlattenHour` | true / 22 | Close all positions at end of day |
-| `InpRiskPercent` | 0.5 | % of equity risked per trade |
+| `InpBaseLot` | 0.01 | Starting lot of each sequence |
+| `InpLotStep` | 0.01 | Lot increase for the next same-direction trade |
+| `InpReverseMult` | 2.0 | Lot multiplier applied on a reversal trade |
+| `InpMaxLot` | 2.0 | Hard cap on any single position's lot size |
+| `InpReenterInTrend` | true | Re-enter after a TP/SL exit while the trend persists |
+| `InpDailyLotReset` | true | Restart the lot sequence at the base lot each day |
 | `InpATRMultSL` / `InpRewardRisk` | 1.5 / 2.0 | Stop-loss and take-profit geometry |
 | `InpMaxTotalPos` | 3 | Max simultaneous positions |
 | `InpMagic` | 21550708 | Magic number (EA only touches its own trades) |
@@ -73,14 +80,21 @@ In the MT5 Strategy Tester:
 ## Honest expectations — read this
 
 - **$1,200/day is a booking target, not a guarantee.** The EA locks in $1,200
-  on days the strategy gets there and caps damage on days it doesn't. No EA
-  can produce a fixed daily profit; anything promising that is a martingale
-  waiting to blow up.
+  on days the strategy gets there. No EA can produce a fixed daily profit.
+- **The doubling-on-reversal sizing is a martingale variant.** In a choppy
+  market the EMAs can cross many times in a day; each reversal doubles the
+  lot (0.01 → 0.02 → 0.04 → 0.08 → …), so ten consecutive whipsaws would ask
+  for 10+ lots. `InpMaxLot` (default 2.0) exists as a circuit breaker — do
+  not raise it casually, and watch the sequence behaviour in the backtest
+  before anything else. With no daily loss limit, a bad ranging day has no
+  floor other than the per-trade ATR stops.
 - EMA crossovers are a **trend-following** signal: they perform in trending
   markets and get whipsawed in ranges. Intrabar mode reacts faster but takes
   more whipsaw trades than closed-candle mode — backtest both.
 - EURUSD, GBPUSD and GBPJPY are correlated (GBP appears twice), so
-  simultaneous signals often win or lose together. That's why the default max
-  position count and per-trade risk are conservative.
+  simultaneous signals often win or lose together.
+- The lot-sequence state (last lot / direction per symbol) lives in memory
+  only: an EA or terminal restart mid-day restarts sequences at the base lot.
+  The daily P/L tracking itself does survive restarts.
 - All hour-based inputs use **broker server time**, which usually differs from
   your local time.

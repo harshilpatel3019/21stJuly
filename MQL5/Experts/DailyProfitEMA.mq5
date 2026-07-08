@@ -5,13 +5,16 @@
 //|  - Trades EURUSD, GBPUSD, GBPJPY from a single chart (H1)        |
 //|  - Enters when EMA(21) crosses EMA(55), intrabar or on close     |
 //|  - Books profit and halts for the day once the daily $ target    |
-//|    is reached; also halts on a daily max loss                    |
+//|    is reached                                                    |
+//|  - Progressive lots: sequences start at the base lot, grow by a  |
+//|    step while the trend persists, double on reversal trades      |
 //|  - Flattens everything at end of day (intraday bot)              |
 //+------------------------------------------------------------------+
-#property version     "1.00"
+#property version     "1.10"
 #property description "EMA 21/55 cross entries on H1 (intrabar or closed candle)."
-#property description "Books profit at a daily $ target, stops at a daily max loss,"
-#property description "and goes flat at end of day."
+#property description "Progressive lot sizing (grows with the trend, doubles on"
+#property description "reversal). Books profit at a daily $ target and goes flat"
+#property description "at end of day."
 
 #include <Trade/Trade.mqh>
 
@@ -25,12 +28,18 @@ input bool            InpCloseOnOpposite  = true;                   // Close pos
 
 input group "=== Daily profit booking ==="
 input double          InpDailyTarget      = 1200.0;                 // Daily profit target ($): book & stop
-input double          InpDailyMaxLoss     = 600.0;                  // Daily max loss ($): stop for the day
 input bool            InpFlattenAtEOD     = true;                   // Close everything at end of day
 input int             InpFlattenHour      = 22;                     // End-of-day flatten hour (server time)
 
-input group "=== Risk ==="
-input double          InpRiskPercent      = 0.5;                    // Risk per trade (% of equity)
+input group "=== Lot sizing (progressive) ==="
+input double          InpBaseLot          = 0.01;                   // Starting lot of a sequence
+input double          InpLotStep          = 0.01;                   // Lot increase for next same-direction trade
+input double          InpReverseMult      = 2.0;                    // Lot multiplier on a reversal trade
+input double          InpMaxLot           = 2.0;                    // Hard cap per position (safety)
+input bool            InpReenterInTrend   = true;                   // Re-enter after TP/SL while trend persists
+input bool            InpDailyLotReset    = true;                   // Restart lot sequence each day
+
+input group "=== Exits ==="
 input int             InpATRPeriod        = 14;                     // ATR period (stop-loss sizing)
 input double          InpATRMultSL        = 1.5;                    // Stop loss = ATR x this
 input double          InpRewardRisk       = 2.0;                    // Take profit = SL distance x this
@@ -51,6 +60,9 @@ int      g_hSlow[];
 int      g_hATR[];
 int      g_rel[];        // +1 fast>slow, -1 fast<slow, 0 not initialised yet
 datetime g_lastBar[];    // last evaluated bar per symbol (closed-candle mode)
+double   g_lastLot[];    // last opened lot per symbol (progression state)
+int      g_lastDir[];    // last trade direction per symbol (+1/-1, 0 = none)
+datetime g_entryBar[];   // bar of last entry per symbol (re-entry throttle)
 
 double   g_dayStartEquity = 0.0;
 datetime g_dayStamp       = 0;   // server midnight of the current trading day
@@ -75,6 +87,9 @@ int OnInit()
    ArrayResize(g_hATR, n);
    ArrayResize(g_rel, n);
    ArrayResize(g_lastBar, n);
+   ArrayResize(g_lastLot, n);
+   ArrayResize(g_lastDir, n);
+   ArrayResize(g_entryBar, n);
 
    g_count = 0;
    for(int i = 0; i < n; i++)
@@ -100,8 +115,11 @@ int OnInit()
          Print("DailyProfitEMA: failed to create indicator handles for ", s);
          return INIT_FAILED;
       }
-      g_rel[g_count]     = 0;
-      g_lastBar[g_count] = 0;
+      g_rel[g_count]      = 0;
+      g_lastBar[g_count]  = 0;
+      g_lastLot[g_count]  = 0.0;
+      g_lastDir[g_count]  = 0;
+      g_entryBar[g_count] = 0;
       g_count++;
    }
 
@@ -156,6 +174,13 @@ void StartOrRestoreDay()
    }
    g_dayStamp    = today;
    g_bookedToday = false;
+
+   if(InpDailyLotReset)
+      for(int i = 0; i < g_count; i++)
+      {
+         g_lastLot[i] = 0.0;
+         g_lastDir[i] = 0;
+      }
 }
 
 //+------------------------------------------------------------------+
@@ -166,7 +191,7 @@ void DoWork()
       StartOrRestoreDay();
 
    double dayPL  = AccountInfoDouble(ACCOUNT_EQUITY) - g_dayStartEquity;
-   bool   halted = (dayPL >= InpDailyTarget) || (dayPL <= -InpDailyMaxLoss);
+   bool   halted = (dayPL >= InpDailyTarget);
 
    if(halted && CountOurPositions() > 0)
    {
@@ -174,8 +199,8 @@ void DoWork()
       if(!g_bookedToday)
       {
          g_bookedToday = true;
-         PrintFormat("DailyProfitEMA: daily %s hit (%.2f). All positions closed, trading halted until tomorrow.",
-                     dayPL >= InpDailyTarget ? "profit target" : "max loss", dayPL);
+         PrintFormat("DailyProfitEMA: daily profit target hit (%.2f). All positions closed, trading halted until tomorrow.",
+                     dayPL);
       }
    }
 
@@ -223,20 +248,38 @@ void ProcessSymbol(const int i, const bool canOpen)
       sig = rel;                       // +1 = bullish cross, -1 = bearish cross
    g_rel[i] = rel;
 
-   if(sig == 0)
+   if(sig != 0)
+   {
+      if(InpCloseOnOpposite)
+         CloseSymbolDir(g_sym[i], sig == 1 ? POSITION_TYPE_SELL : POSITION_TYPE_BUY);
+
+      if(!canOpen)
+         return;
+      if(HasPosition(g_sym[i]))
+         return;
+      if(CountOurPositions() >= InpMaxTotalPos)
+         return;
+
+      OpenTrade(i, sig);   // reversal trade: NextLot doubles the previous lot
       return;
+   }
 
-   if(InpCloseOnOpposite)
-      CloseSymbolDir(g_sym[i], sig == 1 ? POSITION_TYPE_SELL : POSITION_TYPE_BUY);
-
-   if(!canOpen)
+   // No cross this tick. If a previous trade in the trend direction was
+   // closed by TP/SL and the trend still holds, re-enter with a gradually
+   // increased lot (at most one entry per H1 bar per symbol).
+   if(!InpReenterInTrend || !canOpen)
+      return;
+   if(rel == 0 || g_lastDir[i] != rel)
       return;
    if(HasPosition(g_sym[i]))
       return;
    if(CountOurPositions() >= InpMaxTotalPos)
       return;
+   datetime bt = iTime(g_sym[i], InpTF, 0);
+   if(bt == 0 || bt == g_entryBar[i])
+      return;
 
-   OpenTrade(i, sig);
+   OpenTrade(i, rel);      // same-direction trade: NextLot adds the lot step
 }
 
 //+------------------------------------------------------------------+
@@ -252,7 +295,7 @@ void OpenTrade(const int i, const int dir)
    if(slDist <= 0.0)
       return;
 
-   double lots = CalcLots(s, slDist);
+   double lots = NextLot(i, dir);
    if(lots <= 0.0)
       return;
 
@@ -269,42 +312,48 @@ void OpenTrade(const int i, const int dir)
    bool ok = (dir == 1)
              ? g_trade.Buy(lots, s, 0.0, sl, tp, "EMA 21x55 up")
              : g_trade.Sell(lots, s, 0.0, sl, tp, "EMA 21x55 down");
-   if(!ok)
+   if(ok)
+   {
+      g_lastLot[i]  = lots;
+      g_lastDir[i]  = dir;
+      g_entryBar[i] = iTime(s, InpTF, 0);
+   }
+   else
       PrintFormat("DailyProfitEMA: order failed on %s (%s), retcode=%d",
                   s, dir == 1 ? "buy" : "sell", g_trade.ResultRetcode());
 }
 
 //+------------------------------------------------------------------+
-//| Position size so that hitting the stop loses InpRiskPercent of   |
-//| current equity. Skips the trade (rather than oversizing) if even |
-//| the minimum lot would risk more than configured.                 |
+//| Progressive lot sequence per symbol:                             |
+//|   first trade            -> InpBaseLot                           |
+//|   same direction as last -> last lot + InpLotStep                |
+//|   reversal               -> last lot x InpReverseMult            |
+//| Capped at InpMaxLot and normalised to the broker's volume rules. |
 //+------------------------------------------------------------------+
-double CalcLots(const string s, const double slDist)
+double NextLot(const int i, const int dir)
 {
-   double tickVal = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_VALUE);
-   double tickSz  = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_SIZE);
-   if(tickVal <= 0.0 || tickSz <= 0.0)
-      return 0.0;
+   string s = g_sym[i];
+   double lot;
+   if(g_lastDir[i] == 0 || g_lastLot[i] <= 0.0)
+      lot = InpBaseLot;
+   else if(dir == g_lastDir[i])
+      lot = g_lastLot[i] + InpLotStep;
+   else
+      lot = g_lastLot[i] * InpReverseMult;
 
-   double riskMoney  = AccountInfoDouble(ACCOUNT_EQUITY) * InpRiskPercent / 100.0;
-   double lossPerLot = slDist / tickSz * tickVal;
-   if(lossPerLot <= 0.0)
-      return 0.0;
+   if(lot > InpMaxLot)
+      lot = InpMaxLot;
 
-   double lots = riskMoney / lossPerLot;
    double step = SymbolInfoDouble(s, SYMBOL_VOLUME_STEP);
    double minL = SymbolInfoDouble(s, SYMBOL_VOLUME_MIN);
    double maxL = SymbolInfoDouble(s, SYMBOL_VOLUME_MAX);
    if(step > 0.0)
-      lots = MathFloor(lots / step) * step;
-   if(lots < minL)
-   {
-      PrintFormat("DailyProfitEMA: skipping %s, computed lot %.2f below broker minimum %.2f", s, lots, minL);
-      return 0.0;
-   }
-   if(lots > maxL)
-      lots = maxL;
-   return NormalizeDouble(lots, 2);
+      lot = MathRound(lot / step) * step;
+   if(lot < minL)
+      lot = minL;
+   if(lot > maxL)
+      lot = maxL;
+   return NormalizeDouble(lot, 2);
 }
 
 //+------------------------------------------------------------------+
