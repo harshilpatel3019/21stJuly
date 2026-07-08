@@ -1,124 +1,83 @@
-# DailyProfitEMA — EMA 21/55 intraday EA with daily profit booking
+# DailyProfitEMA v2 — EMA-band seeded grid with basket take-profit
 
-A MetaTrader 5 Expert Advisor that trades **the symbol of the chart it is
-attached to** (attach it to EURUSD, GBPUSD, GBPJPY — any pair — on **H1**),
-enters on **EMA(21) / EMA(55) crossovers**, and manages the account like an
-intraday prop trader. Optionally, a comma-separated symbol list input lets one
-chart instance trade several pairs at once.
+A MetaTrader 5 Expert Advisor for **EURUSD H1** (attach to the chart of the
+pair you want; it trades that chart's symbol). It runs self-contained
+**cycles**:
 
-- **Books profit for the day** — once the **combined floating profit** of the
-  open trades reaches the daily target (default **$1,200**), every position is
-  closed and no new trade is opened until the next day.
-- **Progressive lot sizing** — sequences start at **0.01**, grow by a step
-  while the trend keeps paying, and a reversal trade opens at **double** the
-  previous trade's lot.
-- **No per-trade SL/TP by default** and **no daily loss limit** — positions
-  float freely until the basket target, an opposite cross, or end of day
-  closes them, so the full floating swing of a cycle is visible. The only
-  hard protection left is the per-position lot cap. ATR-based SL/TP can be
-  re-enabled via inputs.
-- **Goes flat at end of day** (default 22:00 server time) — it is an intraday
-  bot and holds nothing overnight.
+1. **Seed** — on each H1 candle close, if that candle's **open OR close lies
+   between EMA(21) and EMA(55)**, and the EA is flat, it opens **1 BUY + 1
+   SELL** at the seed lot (0.01 each). Only when flat — one fresh cycle at a
+   time.
+2. **Grid** — every grid step of price movement it adds a trade in the
+   direction of the move: price up → BUY, price down → SELL. The step is
+   defined in money: **$2.00 of P/L per seed lot**, which on EURUSD with a
+   0.01 seed equals **20 pips** (0.0020). A gap through several bands adds one
+   trade per band.
+3. **Running-lot sizing** — the running lot starts at 0.01. Each time the
+   grid **direction flips**, it grows **×1.5** (0.01 → 0.015 → 0.0225 → …).
+   Trades continuing the same direction reuse the current running lot.
+   (Broker volume steps apply: with a 0.01-lot step, 0.015 rounds to 0.02 on
+   the order, but the internal sequence keeps compounding exactly.)
+4. **Basket take-profit** — no per-trade SL or TP. When the **combined
+   floating P/L** of the cycle reaches **+$1,200**, ALL positions are closed
+   and the EA waits for the next band entry. No lot cap by default
+   (`InpMaxLot` = 0), no trend filter.
 
-## Strategy logic
+## Restart behaviour
 
-| Rule | Behaviour |
-|---|---|
-| Buy | EMA(21) crosses **above** EMA(55) |
-| Sell | EMA(21) crosses **below** EMA(55) |
-| Signal timing | By default reacts **intrabar** (on the forming H1 candle, per tick). Set `InpIntrabar=false` to only act on closed candles. |
-| Exit | Close on the opposite cross, basket booking at the floating target, and the end-of-day flatten. No per-trade SL/TP by default (`InpATRMultSL` / `InpATRMultTP` = 0); set them > 0 to add ATR-based stops back. |
-| Position size | Progressive sequence per symbol: first trade `0.01`; a same-direction re-entry (after a TP/SL exit while the trend persists, max one per H1 bar) adds `InpLotStep` (default 0.01); a reversal trade multiplies the last lot by `InpReverseMult` (default 2×). Capped at `InpMaxLot`; sequence restarts at the base lot each day. |
-| Concurrency | One position per symbol, max 3 total. |
-| Session | New entries only between 07:00–20:00 server time by default. |
-
-The cross detector is a state machine on the fast/slow EMA relation, so each
-cross fires exactly once — no duplicate entries while the EMAs hover around
-each other, and no phantom trade at startup from an already-existing trend.
-
-The day-start equity snapshot is persisted in terminal global variables, so a
-terminal or EA restart mid-day does **not** reset the daily profit/loss
-tracking.
-
-**Restart safety:** if the terminal or EA is restarted while trades are still
-open, the EA goes into manage-only mode — it keeps handling exits (SL/TP,
-opposite cross, daily target, end-of-day flatten) but opens **no new trades**
-until every existing position is closed. This prevents stacking fresh entries
-on top of an in-flight cycle whose lot-sequence state was lost in the restart.
+Cycle state (running lot, last grid direction, last band price) is persisted
+in terminal global variables. Restarting MT5 or re-attaching the EA
+**resumes the running cycle** where it left off. If open positions are found
+but the saved state is missing, the EA switches to **manage-only** mode — it
+still books the basket at the target but places no new trades until flat.
 
 ## Installation
 
-1. Open MetaEditor (F4 from MT5), copy `Experts/DailyProfitEMA.mq5` into your
-   terminal's `MQL5/Experts/` folder, and compile (F7).
-2. Attach the EA to the H1 chart of each pair you want traded (e.g. EURUSD
-   H1) — with `InpSymbols` left blank it trades that chart's symbol only.
-3. Enable Algo Trading.
+1. Copy `Experts/DailyProfitEMA.mq5` into your terminal's `MQL5/Experts/`
+   folder and compile in MetaEditor (F7).
+2. Attach to the **EURUSD H1** chart (or any pair — it trades the chart's
+   symbol; `InpSymbolOverride` can force a different one).
+3. Enable Algo Trading. Use a **different magic number per chart** if you run
+   it on several pairs.
 
-**Attaching to multiple charts:** instances sharing the same magic number act
-as **one basket** — the $1,200 floating target sums across all of them, and
-whichever instance reaches it books *everything* and halts them all for the
-day. Give each chart a **different magic number** if you want each pair to
-have its own independent $1,200 target and lot sequence. Note that with a
-shared magic, attaching to a new chart while other charts hold open trades
-also engages the startup lock on that new instance until those trades close.
-
-## Backtesting (do this before any live money)
-
-In the MT5 Strategy Tester:
-
-- Chart: EURUSD H1, model **"Every tick based on real ticks"** (intrabar
-  signals need tick data; "Open prices only" will not reproduce them).
-- The tester automatically pulls data for the other two symbols the EA
-  requests.
-- Test at least 2–3 years, then forward-test on a **demo account** for a few
-  weeks.
-
-## Key inputs
+## Inputs
 
 | Input | Default | Meaning |
 |---|---|---|
-| `InpSymbols` | *(blank)* | Blank = trade the chart's own symbol; or a comma-separated list (e.g. `EURUSD,GBPUSD,GBPJPY`) to trade several from one chart |
+| `InpSymbolOverride` | *(blank)* | Blank = trade the chart's symbol |
 | `InpTF` | H1 | Signal timeframe |
-| `InpFastEMA` / `InpSlowEMA` | 21 / 55 | EMA periods |
-| `InpIntrabar` | true | React to crosses on the open candle |
-| `InpDailyTarget` | 1200 | Floating profit ($) of the open basket at which all trades are booked and trading stops for the day |
-| `InpFlattenAtEOD` / `InpFlattenHour` | true / 22 | Close all positions at end of day |
-| `InpBaseLot` | 0.01 | Starting lot of each sequence |
-| `InpLotStep` | 0.01 | Lot increase for the next same-direction trade |
-| `InpReverseMult` | 2.0 | Lot multiplier applied on a reversal trade |
-| `InpMaxLot` | 2.0 | Hard cap on any single position's lot size |
-| `InpReenterInTrend` | true | Re-enter after a TP/SL exit while the trend persists |
-| `InpDailyLotReset` | true | Restart the lot sequence at the base lot each day |
-| `InpATRMultSL` / `InpATRMultTP` | 0 / 0 | Optional per-trade SL/TP in ATR multiples (0 = disabled) |
-| `InpMaxTotalPos` | 3 | Max simultaneous positions |
-| `InpMagic` | 21550708 | Magic number (EA only touches its own trades) |
+| `InpFastEMA` / `InpSlowEMA` | 21 / 55 | EMA band |
+| `InpSeedLot` | 0.01 | Seed lot for the 1 BUY + 1 SELL cycle start |
+| `InpGridUSD` | 2.0 | Grid step as $ of P/L per seed lot ($2 on 0.01 EURUSD = 20 pips) |
+| `InpFlipMult` | 1.5 | Running-lot multiplier on each direction flip |
+| `InpMaxLot` | 0 | Lot cap per trade (0 = none, per spec) |
+| `InpBasketTP` | 1200 | Floating P/L ($) at which the whole cycle is booked |
+| `InpFlattenAtEOD` / `InpFlattenHour` | false / 22 | Optional end-of-day close-all (off: cycles usually span days) |
+| `InpMagic` | 21550708 | Magic number (EA only touches its own trades on its own symbol) |
 
-## Honest expectations — read this
+## Backtesting
 
-- **$1,200/day is a booking target, not a guarantee.** The EA locks in $1,200
-  on days the strategy gets there. No EA can produce a fixed daily profit.
-- **The doubling-on-reversal sizing is a martingale variant.** In a choppy
-  market the EMAs can cross many times in a day; each reversal doubles the
-  lot (0.01 → 0.02 → 0.04 → 0.08 → …), so ten consecutive whipsaws would ask
-  for 10+ lots. `InpMaxLot` (default 2.0) exists as a circuit breaker — do
-  not raise it casually, and watch the sequence behaviour in the backtest
-  before anything else.
-- **With no SL and no daily loss limit, drawdown is unbounded until margin
-  call.** A position on the wrong side of a strong trend floats a growing
-  loss all day with nothing to cut it except the opposite cross or the
-  end-of-day flatten. This configuration is for observing cycle behaviour in
-  the Strategy Tester / on demo — it is not a live-money risk setup.
-- Realized profit no longer counts toward the daily target: booking triggers
-  only when the **open basket's floating** P/L reaches `InpDailyTarget`.
-  Profit already realized by reversal closes doesn't accumulate into the
-  trigger.
-- EMA crossovers are a **trend-following** signal: they perform in trending
-  markets and get whipsawed in ranges. Intrabar mode reacts faster but takes
-  more whipsaw trades than closed-candle mode — backtest both.
-- EURUSD, GBPUSD and GBPJPY are correlated (GBP appears twice), so
-  simultaneous signals often win or lose together.
-- The lot-sequence state (last lot / direction per symbol) lives in memory
-  only: an EA or terminal restart mid-day restarts sequences at the base lot.
-  The daily P/L tracking itself does survive restarts.
-- All hour-based inputs use **broker server time**, which usually differs from
-  your local time.
+Strategy Tester → EURUSD, H1 chart, model **"Every tick based on real
+ticks"**. Watch three things: the **equity vs. balance gap** (floating
+drawdown of a cycle), the **largest lot reached** after consecutive flips,
+and the **margin level** at the drawdown trough. Test a strong trending
+period and a long ranging period separately — this system's risk lives in
+the ranges.
+
+## Read this before running it
+
+- **This is a grid-martingale.** Every direction flip multiplies the running
+  lot by 1.5; a long choppy range flips constantly (×1.5¹⁰ ≈ ×57, ×1.5²⁰ ≈
+  ×3,325 of the seed lot). With **no SL, no lot cap and no loss limit**, the
+  only hard floor is the broker's margin call.
+- **The $1,200 basket target is far away from a 0.01 seed.** A clean 200-pip
+  one-way run with 20-pip grid adds earns on the order of tens of dollars,
+  not $1,200 — cycles will either run for a very long time, or reach the
+  target only after the running lot has grown large (i.e. after surviving
+  deep drawdown). Consider testing smaller basket targets (e.g. $12–$50 per
+  0.01 seed) or a larger seed lot, and scale from what the tester shows.
+- Both seed legs open together, so one of them is always immediately losing;
+  the cycle's floating P/L starts near zero minus spread.
+- All hour-based inputs use **broker server time**.
+- Backtest and demo only until you have seen a full year of cycles,
+  including 2022-style one-way trends and long ranges.

@@ -1,154 +1,115 @@
 //+------------------------------------------------------------------+
 //|                                               DailyProfitEMA.mq5 |
-//|        EMA 21/55 crossover intraday EA with daily profit booking |
+//|      EMA-band seeded grid EA with basket take-profit (v2)        |
 //|                                                                  |
-//|  - Trades the symbol of the chart it is attached to (H1); a     |
-//|    comma-separated list can be set to trade several from one    |
-//|    chart instead                                                 |
-//|  - Enters when EMA(21) crosses EMA(55), intrabar or on close     |
-//|  - No per-trade SL/TP by default: books ALL trades and halts for |
-//|    the day once floating profit reaches the daily $ target       |
-//|  - Progressive lots: sequences start at the base lot, grow by a  |
-//|    step while the trend persists, double on reversal trades      |
-//|  - Flattens everything at end of day (intraday bot)              |
+//|  Cycle lifecycle (one symbol per chart instance):                |
+//|  1. SEED: on each H1 candle close, if the candle's open OR close |
+//|     lies between EMA(21) and EMA(55), and the EA is flat, open   |
+//|     1 BUY + 1 SELL at the seed lot (one fresh cycle).            |
+//|  2. GRID: every grid step of price movement (default $2.00 of    |
+//|     P/L per seed lot, = 20 pips on EURUSD) add a trade in the    |
+//|     direction of the move: price up -> BUY, price down -> SELL.  |
+//|  3. SIZING: a running lot starts at the seed lot; every time the |
+//|     grid direction flips it grows x1.5; same-direction trades    |
+//|     reuse the current running lot (0.01 -> 0.015 -> 0.0225 ...). |
+//|  4. EXIT: no per-trade SL/TP. When the combined floating P/L of  |
+//|     the cycle reaches the basket target, ALL positions close and |
+//|     the EA waits for the next band entry.                        |
+//|                                                                  |
+//|  Cycle state persists in terminal global variables, so a restart |
+//|  resumes the running cycle. If positions exist but the saved     |
+//|  state is missing, the EA manages exits only (no new trades)     |
+//|  until flat.                                                     |
 //+------------------------------------------------------------------+
-#property version     "1.20"
-#property description "EMA 21/55 cross entries on H1 (intrabar or closed candle)."
-#property description "Progressive lot sizing (grows with the trend, doubles on"
-#property description "reversal). No per-trade SL/TP by default; books all trades"
-#property description "when floating profit hits the daily $ target, flat at EOD."
+#property version     "2.00"
+#property description "Seeds 1 BUY + 1 SELL when an H1 candle closes with its"
+#property description "open/close between EMA21 and EMA55. Grid-adds with the"
+#property description "move every fixed $ step, running lot x1.5 on each flip,"
+#property description "books ALL trades at the basket floating-profit target."
 
 #include <Trade/Trade.mqh>
 
-input group "=== Strategy ==="
-input string          InpSymbols          = "";                     // Symbols (comma separated; empty = chart symbol)
-input ENUM_TIMEFRAMES InpTF               = PERIOD_H1;              // Signal timeframe
-input int             InpFastEMA          = 21;                     // Fast EMA period
-input int             InpSlowEMA          = 55;                     // Slow EMA period
-input bool            InpIntrabar         = true;                   // React to crosses on the forming candle
-input bool            InpCloseOnOpposite  = true;                   // Close position on opposite cross
+input group "=== Market / signal ==="
+input string          InpSymbolOverride = "";        // Symbol (empty = chart symbol)
+input ENUM_TIMEFRAMES InpTF             = PERIOD_H1; // Timeframe
+input int             InpFastEMA        = 21;        // Fast EMA period
+input int             InpSlowEMA        = 55;        // Slow EMA period
 
-input group "=== Daily profit booking ==="
-input double          InpDailyTarget      = 1200.0;                 // Floating profit ($) at which ALL trades are booked
-input bool            InpFlattenAtEOD     = true;                   // Close everything at end of day
-input int             InpFlattenHour      = 22;                     // End-of-day flatten hour (server time)
+input group "=== Cycle seeding ==="
+input double          InpSeedLot        = 0.01;      // Seed lot (1 BUY + 1 SELL)
 
-input group "=== Lot sizing (progressive) ==="
-input double          InpBaseLot          = 0.01;                   // Starting lot of a sequence
-input double          InpLotStep          = 0.01;                   // Lot increase for next same-direction trade
-input double          InpReverseMult      = 2.0;                    // Lot multiplier on a reversal trade
-input double          InpMaxLot           = 2.0;                    // Hard cap per position (safety)
-input bool            InpReenterInTrend   = true;                   // Re-enter after TP/SL while trend persists
-input bool            InpDailyLotReset    = true;                   // Restart lot sequence each day
+input group "=== Grid ==="
+input double          InpGridUSD        = 2.0;       // Grid step: $ P/L move per seed lot
+input double          InpFlipMult       = 1.5;       // Running-lot multiplier on direction flip
+input double          InpMaxLot         = 0.0;       // Lot cap (0 = none)
 
-input group "=== Optional per-trade exits (0 = disabled) ==="
-input int             InpATRPeriod        = 14;                     // ATR period
-input double          InpATRMultSL        = 0.0;                    // Stop loss in ATR multiples (0 = no SL)
-input double          InpATRMultTP        = 0.0;                    // Take profit in ATR multiples (0 = no TP)
-input int             InpMaxTotalPos      = 3;                      // Max open positions across all symbols
+input group "=== Basket exit ==="
+input double          InpBasketTP       = 1200.0;    // Close ALL at this floating P/L ($)
 
-input group "=== Session / misc ==="
-input bool            InpUseSession       = true;                   // Only open new trades inside session
-input int             InpSessionStart     = 7;                      // Session start hour (server time)
-input int             InpSessionEnd       = 20;                     // Session end hour (server time)
-input long            InpMagic            = 21550708;               // Magic number
+input group "=== Misc ==="
+input bool            InpFlattenAtEOD   = false;     // Close everything at end of day
+input int             InpFlattenHour    = 22;        // End-of-day flatten hour (server time)
+input long            InpMagic          = 21550708;  // Magic number
 
 CTrade   g_trade;
+string   g_symbol;
+int      g_hFast = INVALID_HANDLE;
+int      g_hSlow = INVALID_HANDLE;
+datetime g_seedBarChecked = 0;   // last bar evaluated for seeding
 
-int      g_count = 0;
-string   g_sym[];
-int      g_hFast[];
-int      g_hSlow[];
-int      g_hATR[];
-int      g_rel[];        // +1 fast>slow, -1 fast<slow, 0 not initialised yet
-datetime g_lastBar[];    // last evaluated bar per symbol (closed-candle mode)
-double   g_lastLot[];    // last opened lot per symbol (progression state)
-int      g_lastDir[];    // last trade direction per symbol (+1/-1, 0 = none)
-datetime g_entryBar[];   // bar of last entry per symbol (re-entry throttle)
+// --- cycle state (persisted in global variables across restarts) ---
+bool     g_cycleActive = false;
+double   g_runningLot  = 0.0;    // unrounded running lot of the sequence
+int      g_lastGridDir = 0;      // +1 last grid trade was BUY, -1 SELL, 0 none yet
+double   g_lastBand    = 0.0;    // price level of the last grid band
+bool     g_booking     = false;  // basket target hit, closing everything
+bool     g_manageOnly  = false;  // positions found at startup without saved state
 
-datetime g_dayStamp    = 0;      // server midnight of the current trading day
-bool     g_bookedToday = false;  // daily target reached: no more trading today
-bool     g_restartLock    = false; // positions found at startup: manage only, no new trades
-
-string GVName(const string suffix) { return "DPEA_" + (string)InpMagic + "_" + suffix; }
+string GVName(const string suffix)
+{
+   return "DPEA2_" + (string)InpMagic + "_" + g_symbol + "_" + suffix;
+}
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   string syms = InpSymbols;
-   StringTrimLeft(syms);
-   StringTrimRight(syms);
-   if(syms == "")
-      syms = _Symbol;   // blank input: trade the chart's own symbol
-
-   string parts[];
-   int n = StringSplit(syms, ',', parts);
-   if(n <= 0)
+   g_symbol = InpSymbolOverride;
+   StringTrimLeft(g_symbol);
+   StringTrimRight(g_symbol);
+   if(g_symbol == "")
+      g_symbol = _Symbol;
+   if(!SymbolSelect(g_symbol, true))
    {
-      Print("DailyProfitEMA: no symbols configured");
+      Print("DailyProfitEMA: symbol not found in Market Watch: ", g_symbol);
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   ArrayResize(g_sym, n);
-   ArrayResize(g_hFast, n);
-   ArrayResize(g_hSlow, n);
-   ArrayResize(g_hATR, n);
-   ArrayResize(g_rel, n);
-   ArrayResize(g_lastBar, n);
-   ArrayResize(g_lastLot, n);
-   ArrayResize(g_lastDir, n);
-   ArrayResize(g_entryBar, n);
-
-   g_count = 0;
-   for(int i = 0; i < n; i++)
+   g_hFast = iMA(g_symbol, InpTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   g_hSlow = iMA(g_symbol, InpTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   if(g_hFast == INVALID_HANDLE || g_hSlow == INVALID_HANDLE)
    {
-      string s = parts[i];
-      StringTrimLeft(s);
-      StringTrimRight(s);
-      if(s == "")
-         continue;
-      if(!SymbolSelect(s, true))
-      {
-         Print("DailyProfitEMA: symbol not found in Market Watch: ", s);
-         return INIT_PARAMETERS_INCORRECT;
-      }
-      g_sym[g_count]   = s;
-      g_hFast[g_count] = iMA(s, InpTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
-      g_hSlow[g_count] = iMA(s, InpTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
-      g_hATR[g_count]  = iATR(s, InpTF, InpATRPeriod);
-      if(g_hFast[g_count] == INVALID_HANDLE ||
-         g_hSlow[g_count] == INVALID_HANDLE ||
-         g_hATR[g_count]  == INVALID_HANDLE)
-      {
-         Print("DailyProfitEMA: failed to create indicator handles for ", s);
-         return INIT_FAILED;
-      }
-      g_rel[g_count]      = 0;
-      g_lastBar[g_count]  = 0;
-      g_lastLot[g_count]  = 0.0;
-      g_lastDir[g_count]  = 0;
-      g_entryBar[g_count] = 0;
-      g_count++;
-   }
-
-   if(g_count == 0)
-   {
-      Print("DailyProfitEMA: symbol list is empty");
-      return INIT_PARAMETERS_INCORRECT;
+      Print("DailyProfitEMA: failed to create EMA handles for ", g_symbol);
+      return INIT_FAILED;
    }
 
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(20);
 
-   // After a terminal/EA restart the lot-sequence state is lost, so if
-   // trades are still open, only manage them — do not stack new entries
-   // on top. The lock clears once all existing positions are closed.
-   g_restartLock = (CountOurPositions() > 0);
-   if(g_restartLock)
-      Print("DailyProfitEMA: existing positions found at startup; new entries locked until they are closed.");
+   if(CountPositions() > 0)
+   {
+      if(LoadCycle())
+         PrintFormat("DailyProfitEMA: resumed cycle on %s (running lot %.4f, last band %.5f)",
+                     g_symbol, g_runningLot, g_lastBand);
+      else
+      {
+         g_manageOnly = true;
+         Print("DailyProfitEMA: positions found without saved cycle state; managing exits only until flat.");
+      }
+   }
+   else
+      EndCycle();
 
-   StartOrRestoreDay();
-   EventSetTimer(1);   // evaluate all symbols even when the chart symbol is quiet
+   EventSetTimer(1);
    return INIT_SUCCEEDED;
 }
 
@@ -156,221 +117,195 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   for(int i = 0; i < g_count; i++)
-   {
-      if(g_hFast[i] != INVALID_HANDLE) IndicatorRelease(g_hFast[i]);
-      if(g_hSlow[i] != INVALID_HANDLE) IndicatorRelease(g_hSlow[i]);
-      if(g_hATR[i]  != INVALID_HANDLE) IndicatorRelease(g_hATR[i]);
-   }
+   if(g_hFast != INVALID_HANDLE) IndicatorRelease(g_hFast);
+   if(g_hSlow != INVALID_HANDLE) IndicatorRelease(g_hSlow);
+   // cycle state intentionally left in global variables for restart
 }
 
 void OnTick()  { DoWork(); }
 void OnTimer() { DoWork(); }
 
 //+------------------------------------------------------------------+
-//| Roll the trading day. The booked flag survives EA/terminal       |
-//| restarts via a global variable so a restart after booking cannot |
-//| restart trading on the same day.                                 |
-//+------------------------------------------------------------------+
-void StartOrRestoreDay()
-{
-   datetime today   = TimeCurrent() - TimeCurrent() % 86400;
-   bool     sameDay = GlobalVariableCheck(GVName("date")) &&
-                      (datetime)(long)GlobalVariableGet(GVName("date")) == today;
-   if(sameDay)
-   {
-      g_bookedToday = GlobalVariableCheck(GVName("booked")) &&
-                      GlobalVariableGet(GVName("booked")) > 0.0;
-   }
-   else
-   {
-      GlobalVariableSet(GVName("date"), (double)(long)today);
-      GlobalVariableSet(GVName("booked"), 0.0);
-      g_bookedToday = false;
-   }
-   g_dayStamp = today;
-
-   if(InpDailyLotReset)
-      for(int i = 0; i < g_count; i++)
-      {
-         g_lastLot[i] = 0.0;
-         g_lastDir[i] = 0;
-      }
-}
-
-//+------------------------------------------------------------------+
 void DoWork()
 {
-   datetime today = TimeCurrent() - TimeCurrent() % 86400;
-   if(today != g_dayStamp)
-      StartOrRestoreDay();
+   int positions = CountPositions();
 
-   double floatPL = FloatingPL();
-   if(!g_bookedToday && floatPL >= InpDailyTarget)
+   // Basket take-profit: book everything, then wait for the next seed.
+   if(positions > 0 && !g_booking && FloatingPL() >= InpBasketTP)
    {
-      g_bookedToday = true;
-      GlobalVariableSet(GVName("booked"), 1.0);
-      PrintFormat("DailyProfitEMA: floating profit target hit (%.2f). Booking all trades, halted until tomorrow.",
-                  floatPL);
+      g_booking = true;
+      PrintFormat("DailyProfitEMA: basket target hit (%.2f). Booking all trades on %s.",
+                  FloatingPL(), g_symbol);
    }
-   if(g_bookedToday && CountOurPositions() > 0)
-      CloseAll();   // retried every tick until everything is flat
+   if(g_booking)
+   {
+      if(positions > 0)
+      {
+         CloseAll();          // retried every tick until flat
+         return;
+      }
+      EndCycle();
+      positions = 0;
+   }
 
-   bool halted = g_bookedToday;
-
+   // Optional end-of-day flatten (off by default: grid cycles usually
+   // span days and flattening realises the drawdown).
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    bool eod = InpFlattenAtEOD && dt.hour >= InpFlattenHour;
-   if(eod && CountOurPositions() > 0)
-      CloseAll();
-
-   if(g_restartLock && CountOurPositions() == 0)
+   if(eod)
    {
-      g_restartLock = false;
-      Print("DailyProfitEMA: startup positions closed; new entries unlocked.");
+      if(positions > 0)
+         CloseAll();
+      else if(g_cycleActive)
+         EndCycle();
+      return;
    }
 
-   bool inSession = !InpUseSession || (dt.hour >= InpSessionStart && dt.hour < InpSessionEnd);
-   bool canOpen   = !halted && !eod && inSession && !g_restartLock;
+   // Manage-only mode: positions predate this run and no state exists.
+   if(g_manageOnly)
+   {
+      if(positions > 0)
+         return;
+      g_manageOnly = false;
+      EndCycle();
+   }
 
-   for(int i = 0; i < g_count; i++)
-      ProcessSymbol(i, canOpen);
+   if(positions == 0)
+   {
+      if(g_cycleActive)
+         EndCycle();          // closed externally (manually or by broker)
+      TrySeed();
+      return;
+   }
+
+   if(g_cycleActive)
+      ProcessGrid();
 }
 
 //+------------------------------------------------------------------+
-//| Cross detection is a state machine on the fast/slow relation, so |
-//| each cross fires exactly once — per tick in intrabar mode, per   |
-//| closed candle otherwise. No trade on startup from an already-    |
-//| existing relation: the first evaluation only arms the state.     |
+//| Seed a new cycle: evaluated once per closed H1 candle, only when |
+//| flat. Condition: the closed candle's open OR close lies between  |
+//| EMA(21) and EMA(55).                                             |
 //+------------------------------------------------------------------+
-void ProcessSymbol(const int i, const bool canOpen)
+void TrySeed()
 {
-   int shift = InpIntrabar ? 0 : 1;
+   datetime bt = iTime(g_symbol, InpTF, 0);
+   if(bt == 0 || bt == g_seedBarChecked)
+      return;
+   g_seedBarChecked = bt;
 
-   if(!InpIntrabar)
-   {
-      datetime bt = iTime(g_sym[i], InpTF, 0);
-      if(bt == g_lastBar[i] || bt == 0)
-         return;
-      g_lastBar[i] = bt;
-   }
-
-   double fast[], slow[];
-   ArraySetAsSeries(fast, true);
-   ArraySetAsSeries(slow, true);
-   if(CopyBuffer(g_hFast[i], 0, shift, 1, fast) < 1 ||
-      CopyBuffer(g_hSlow[i], 0, shift, 1, slow) < 1)
+   double emaF[], emaS[];
+   ArraySetAsSeries(emaF, true);
+   ArraySetAsSeries(emaS, true);
+   if(CopyBuffer(g_hFast, 0, 1, 1, emaF) < 1 || CopyBuffer(g_hSlow, 0, 1, 1, emaS) < 1)
       return;
 
-   int rel = fast[0] > slow[0] ? 1 : (fast[0] < slow[0] ? -1 : g_rel[i]);
-   int sig = 0;
-   if(g_rel[i] != 0 && rel != 0 && rel != g_rel[i])
-      sig = rel;                       // +1 = bullish cross, -1 = bearish cross
-   g_rel[i] = rel;
-
-   if(sig != 0)
-   {
-      if(InpCloseOnOpposite)
-         CloseSymbolDir(g_sym[i], sig == 1 ? POSITION_TYPE_SELL : POSITION_TYPE_BUY);
-
-      if(!canOpen)
-         return;
-      if(HasPosition(g_sym[i]))
-         return;
-      if(CountOurPositions() >= InpMaxTotalPos)
-         return;
-
-      OpenTrade(i, sig);   // reversal trade: NextLot doubles the previous lot
-      return;
-   }
-
-   // No cross this tick. If a previous trade in the trend direction was
-   // closed (optional TP/SL, or manually) and the trend still holds,
-   // re-enter with a gradually increased lot (one entry per bar max).
-   if(!InpReenterInTrend || !canOpen)
-      return;
-   if(rel == 0 || g_lastDir[i] != rel)
-      return;
-   if(HasPosition(g_sym[i]))
-      return;
-   if(CountOurPositions() >= InpMaxTotalPos)
-      return;
-   datetime bt = iTime(g_sym[i], InpTF, 0);
-   if(bt == 0 || bt == g_entryBar[i])
+   double o  = iOpen(g_symbol, InpTF, 1);
+   double c  = iClose(g_symbol, InpTF, 1);
+   double lo = MathMin(emaF[0], emaS[0]);
+   double hi = MathMax(emaF[0], emaS[0]);
+   bool inBand = (o >= lo && o <= hi) || (c >= lo && c <= hi);
+   if(!inBand)
       return;
 
-   OpenTrade(i, rel);      // same-direction trade: NextLot adds the lot step
+   double lot = NormLot(InpSeedLot);
+   if(lot <= 0.0)
+      return;
+
+   bool okBuy  = g_trade.Buy(lot, g_symbol, 0.0, 0.0, 0.0, "seed buy");
+   bool okSell = g_trade.Sell(lot, g_symbol, 0.0, 0.0, 0.0, "seed sell");
+   if(!okBuy || !okSell)
+      PrintFormat("DailyProfitEMA: seed order failed on %s (buy=%d sell=%d retcode=%d)",
+                  g_symbol, okBuy, okSell, g_trade.ResultRetcode());
+   if(!okBuy && !okSell)
+      return;
+
+   g_cycleActive = true;
+   g_runningLot  = InpSeedLot;
+   g_lastGridDir = 0;
+   g_lastBand    = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+   SaveCycle();
+   PrintFormat("DailyProfitEMA: new cycle seeded on %s at %.5f", g_symbol, g_lastBand);
 }
 
 //+------------------------------------------------------------------+
-void OpenTrade(const int i, const int dir)
+//| Grid: each time price travels one step from the last band, add a |
+//| trade in the direction of the move. A gap through several bands  |
+//| adds one trade per band.                                         |
+//+------------------------------------------------------------------+
+void ProcessGrid()
 {
-   string s = g_sym[i];
-
-   double lots = NextLot(i, dir);
-   if(lots <= 0.0)
+   double step = GridStepPrice();
+   if(step <= 0.0)
       return;
 
-   int    digits = (int)SymbolInfoInteger(s, SYMBOL_DIGITS);
-   double ask    = SymbolInfoDouble(s, SYMBOL_ASK);
-   double bid    = SymbolInfoDouble(s, SYMBOL_BID);
-   double price  = (dir == 1) ? ask : bid;
-
-   double sl = 0.0, tp = 0.0;   // 0 = order placed without SL/TP
-   if(InpATRMultSL > 0.0 || InpATRMultTP > 0.0)
+   for(int guard = 0; guard < 10; guard++)
    {
-      double atr[];
-      ArraySetAsSeries(atr, true);
-      if(CopyBuffer(g_hATR[i], 0, 0, 2, atr) < 2)
+      double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+      if(bid >= g_lastBand + step)
+      {
+         if(!GridTrade(1, g_lastBand + step))
+            return;
+      }
+      else if(bid <= g_lastBand - step)
+      {
+         if(!GridTrade(-1, g_lastBand - step))
+            return;
+      }
+      else
          return;
-      if(atr[1] <= 0.0)
-         return;
-      if(InpATRMultSL > 0.0)
-         sl = NormalizeDouble((dir == 1) ? price - atr[1] * InpATRMultSL
-                                         : price + atr[1] * InpATRMultSL, digits);
-      if(InpATRMultTP > 0.0)
-         tp = NormalizeDouble((dir == 1) ? price + atr[1] * InpATRMultTP
-                                         : price - atr[1] * InpATRMultTP, digits);
    }
+}
+
+bool GridTrade(const int dir, const double band)
+{
+   if(g_lastGridDir != 0 && dir != g_lastGridDir)
+      g_runningLot *= InpFlipMult;          // direction flip: grow the running lot
+
+   double lot = g_runningLot;
+   if(InpMaxLot > 0.0 && lot > InpMaxLot)
+      lot = InpMaxLot;
+   lot = NormLot(lot);
+   if(lot <= 0.0)
+      return false;
 
    bool ok = (dir == 1)
-             ? g_trade.Buy(lots, s, 0.0, sl, tp, "EMA 21x55 up")
-             : g_trade.Sell(lots, s, 0.0, sl, tp, "EMA 21x55 down");
-   if(ok)
+             ? g_trade.Buy(lot, g_symbol, 0.0, 0.0, 0.0, "grid buy")
+             : g_trade.Sell(lot, g_symbol, 0.0, 0.0, 0.0, "grid sell");
+   if(!ok)
    {
-      g_lastLot[i]  = lots;
-      g_lastDir[i]  = dir;
-      g_entryBar[i] = iTime(s, InpTF, 0);
+      PrintFormat("DailyProfitEMA: grid order failed on %s (%s), retcode=%d",
+                  g_symbol, dir == 1 ? "buy" : "sell", g_trade.ResultRetcode());
+      return false;
    }
-   else
-      PrintFormat("DailyProfitEMA: order failed on %s (%s), retcode=%d",
-                  s, dir == 1 ? "buy" : "sell", g_trade.ResultRetcode());
+
+   g_lastGridDir = dir;
+   g_lastBand    = band;
+   SaveCycle();
+   return true;
 }
 
 //+------------------------------------------------------------------+
-//| Progressive lot sequence per symbol:                             |
-//|   first trade            -> InpBaseLot                           |
-//|   same direction as last -> last lot + InpLotStep                |
-//|   reversal               -> last lot x InpReverseMult            |
-//| Capped at InpMaxLot and normalised to the broker's volume rules. |
+//| Price distance of one grid step: the move that produces          |
+//| InpGridUSD of P/L on the seed lot (e.g. $2 on 0.01 EURUSD =      |
+//| 20 pips).                                                        |
 //+------------------------------------------------------------------+
-double NextLot(const int i, const int dir)
+double GridStepPrice()
 {
-   string s = g_sym[i];
-   double lot;
-   if(g_lastDir[i] == 0 || g_lastLot[i] <= 0.0)
-      lot = InpBaseLot;
-   else if(dir == g_lastDir[i])
-      lot = g_lastLot[i] + InpLotStep;
-   else
-      lot = g_lastLot[i] * InpReverseMult;
+   double tickVal = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSz  = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickVal <= 0.0 || tickSz <= 0.0 || InpSeedLot <= 0.0 || InpGridUSD <= 0.0)
+      return 0.0;
+   return InpGridUSD * tickSz / (tickVal * InpSeedLot);
+}
 
-   if(lot > InpMaxLot)
-      lot = InpMaxLot;
-
-   double step = SymbolInfoDouble(s, SYMBOL_VOLUME_STEP);
-   double minL = SymbolInfoDouble(s, SYMBOL_VOLUME_MIN);
-   double maxL = SymbolInfoDouble(s, SYMBOL_VOLUME_MAX);
+//+------------------------------------------------------------------+
+double NormLot(double lot)
+{
+   double step = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
+   double minL = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
+   double maxL = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MAX);
    if(step > 0.0)
       lot = MathRound(lot / step) * step;
    if(lot < minL)
@@ -381,7 +316,41 @@ double NextLot(const int i, const int dir)
 }
 
 //+------------------------------------------------------------------+
-//| Combined floating P/L of this EA's open positions                |
+//| Cycle state persistence (terminal global variables)              |
+//+------------------------------------------------------------------+
+void SaveCycle()
+{
+   GlobalVariableSet(GVName("active"), g_cycleActive ? 1.0 : 0.0);
+   GlobalVariableSet(GVName("runlot"), g_runningLot);
+   GlobalVariableSet(GVName("dir"),    (double)g_lastGridDir);
+   GlobalVariableSet(GVName("band"),   g_lastBand);
+}
+
+bool LoadCycle()
+{
+   if(!GlobalVariableCheck(GVName("active")) || GlobalVariableGet(GVName("active")) <= 0.0)
+      return false;
+   if(!GlobalVariableCheck(GVName("runlot")) || !GlobalVariableCheck(GVName("band")))
+      return false;
+   g_runningLot  = GlobalVariableGet(GVName("runlot"));
+   g_lastGridDir = (int)GlobalVariableGet(GVName("dir"));
+   g_lastBand    = GlobalVariableGet(GVName("band"));
+   g_cycleActive = (g_runningLot > 0.0 && g_lastBand > 0.0);
+   return g_cycleActive;
+}
+
+void EndCycle()
+{
+   g_cycleActive = false;
+   g_booking     = false;
+   g_runningLot  = 0.0;
+   g_lastGridDir = 0;
+   g_lastBand    = 0.0;
+   GlobalVariableSet(GVName("active"), 0.0);
+}
+
+//+------------------------------------------------------------------+
+//| Position helpers: this instance's trades only (magic + symbol)   |
 //+------------------------------------------------------------------+
 double FloatingPL()
 {
@@ -389,35 +358,24 @@ double FloatingPL()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong t = PositionGetTicket(i);
-      if(t > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic)
+      if(t > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic &&
+         PositionGetString(POSITION_SYMBOL) == g_symbol)
          pl += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
    }
    return pl;
 }
 
-//+------------------------------------------------------------------+
-int CountOurPositions()
+int CountPositions()
 {
    int c = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong t = PositionGetTicket(i);
-      if(t > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic)
+      if(t > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic &&
+         PositionGetString(POSITION_SYMBOL) == g_symbol)
          c++;
    }
    return c;
-}
-
-bool HasPosition(const string s)
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong t = PositionGetTicket(i);
-      if(t > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic &&
-         PositionGetString(POSITION_SYMBOL) == s)
-         return true;
-   }
-   return false;
 }
 
 void CloseAll()
@@ -425,19 +383,8 @@ void CloseAll()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong t = PositionGetTicket(i);
-      if(t > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic)
-         g_trade.PositionClose(t);
-   }
-}
-
-void CloseSymbolDir(const string s, const ENUM_POSITION_TYPE type)
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong t = PositionGetTicket(i);
       if(t > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic &&
-         PositionGetString(POSITION_SYMBOL) == s &&
-         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == type)
+         PositionGetString(POSITION_SYMBOL) == g_symbol)
          g_trade.PositionClose(t);
    }
 }
