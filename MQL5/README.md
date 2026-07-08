@@ -4,15 +4,17 @@ An MetaTrader 5 Expert Advisor that trades **EURUSD, GBPUSD and GBPJPY** from a
 single chart on **H1**, enters on **EMA(21) / EMA(55) crossovers**, and manages
 the account like an intraday prop trader:
 
-- **Books profit for the day** — once the account is up the daily target
-  (default **$1,200**), every position is closed and no new trade is opened
-  until the next day.
+- **Books profit for the day** — once the **combined floating profit** of the
+  open trades reaches the daily target (default **$1,200**), every position is
+  closed and no new trade is opened until the next day.
 - **Progressive lot sizing** — sequences start at **0.01**, grow by a step
   while the trend keeps paying, and a reversal trade opens at **double** the
   previous trade's lot.
-- **No daily loss limit** — the EA does not halt on drawdown, so the full
-  floating swing of a cycle is visible. The only per-position protection is
-  the ATR stop loss and the hard lot cap.
+- **No per-trade SL/TP by default** and **no daily loss limit** — positions
+  float freely until the basket target, an opposite cross, or end of day
+  closes them, so the full floating swing of a cycle is visible. The only
+  hard protection left is the per-position lot cap. ATR-based SL/TP can be
+  re-enabled via inputs.
 - **Goes flat at end of day** (default 22:00 server time) — it is an intraday
   bot and holds nothing overnight.
 
@@ -23,7 +25,7 @@ the account like an intraday prop trader:
 | Buy | EMA(21) crosses **above** EMA(55) |
 | Sell | EMA(21) crosses **below** EMA(55) |
 | Signal timing | By default reacts **intrabar** (on the forming H1 candle, per tick). Set `InpIntrabar=false` to only act on closed candles. |
-| Exit | Fixed SL at `1.5 × ATR(14)`, TP at `2 × SL distance`, plus close on the opposite cross. |
+| Exit | Close on the opposite cross, basket booking at the floating target, and the end-of-day flatten. No per-trade SL/TP by default (`InpATRMultSL` / `InpATRMultTP` = 0); set them > 0 to add ATR-based stops back. |
 | Position size | Progressive sequence per symbol: first trade `0.01`; a same-direction re-entry (after a TP/SL exit while the trend persists, max one per H1 bar) adds `InpLotStep` (default 0.01); a reversal trade multiplies the last lot by `InpReverseMult` (default 2×). Capped at `InpMaxLot`; sequence restarts at the base lot each day. |
 | Concurrency | One position per symbol, max 3 total. |
 | Session | New entries only between 07:00–20:00 server time by default. |
@@ -71,7 +73,7 @@ In the MT5 Strategy Tester:
 | `InpTF` | H1 | Signal timeframe |
 | `InpFastEMA` / `InpSlowEMA` | 21 / 55 | EMA periods |
 | `InpIntrabar` | true | React to crosses on the open candle |
-| `InpDailyTarget` | 1200 | Daily profit ($) at which everything is closed and trading stops |
+| `InpDailyTarget` | 1200 | Floating profit ($) of the open basket at which all trades are booked and trading stops for the day |
 | `InpFlattenAtEOD` / `InpFlattenHour` | true / 22 | Close all positions at end of day |
 | `InpBaseLot` | 0.01 | Starting lot of each sequence |
 | `InpLotStep` | 0.01 | Lot increase for the next same-direction trade |
@@ -79,7 +81,7 @@ In the MT5 Strategy Tester:
 | `InpMaxLot` | 2.0 | Hard cap on any single position's lot size |
 | `InpReenterInTrend` | true | Re-enter after a TP/SL exit while the trend persists |
 | `InpDailyLotReset` | true | Restart the lot sequence at the base lot each day |
-| `InpATRMultSL` / `InpRewardRisk` | 1.5 / 2.0 | Stop-loss and take-profit geometry |
+| `InpATRMultSL` / `InpATRMultTP` | 0 / 0 | Optional per-trade SL/TP in ATR multiples (0 = disabled) |
 | `InpMaxTotalPos` | 3 | Max simultaneous positions |
 | `InpMagic` | 21550708 | Magic number (EA only touches its own trades) |
 
@@ -92,8 +94,16 @@ In the MT5 Strategy Tester:
   lot (0.01 → 0.02 → 0.04 → 0.08 → …), so ten consecutive whipsaws would ask
   for 10+ lots. `InpMaxLot` (default 2.0) exists as a circuit breaker — do
   not raise it casually, and watch the sequence behaviour in the backtest
-  before anything else. With no daily loss limit, a bad ranging day has no
-  floor other than the per-trade ATR stops.
+  before anything else.
+- **With no SL and no daily loss limit, drawdown is unbounded until margin
+  call.** A position on the wrong side of a strong trend floats a growing
+  loss all day with nothing to cut it except the opposite cross or the
+  end-of-day flatten. This configuration is for observing cycle behaviour in
+  the Strategy Tester / on demo — it is not a live-money risk setup.
+- Realized profit no longer counts toward the daily target: booking triggers
+  only when the **open basket's floating** P/L reaches `InpDailyTarget`.
+  Profit already realized by reversal closes doesn't accumulate into the
+  trigger.
 - EMA crossovers are a **trend-following** signal: they perform in trending
   markets and get whipsawed in ranges. Intrabar mode reacts faster but takes
   more whipsaw trades than closed-candle mode — backtest both.

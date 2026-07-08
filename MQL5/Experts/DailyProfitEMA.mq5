@@ -4,17 +4,17 @@
 //|                                                                  |
 //|  - Trades EURUSD, GBPUSD, GBPJPY from a single chart (H1)        |
 //|  - Enters when EMA(21) crosses EMA(55), intrabar or on close     |
-//|  - Books profit and halts for the day once the daily $ target    |
-//|    is reached                                                    |
+//|  - No per-trade SL/TP by default: books ALL trades and halts for |
+//|    the day once floating profit reaches the daily $ target       |
 //|  - Progressive lots: sequences start at the base lot, grow by a  |
 //|    step while the trend persists, double on reversal trades      |
 //|  - Flattens everything at end of day (intraday bot)              |
 //+------------------------------------------------------------------+
-#property version     "1.10"
+#property version     "1.20"
 #property description "EMA 21/55 cross entries on H1 (intrabar or closed candle)."
 #property description "Progressive lot sizing (grows with the trend, doubles on"
-#property description "reversal). Books profit at a daily $ target and goes flat"
-#property description "at end of day."
+#property description "reversal). No per-trade SL/TP by default; books all trades"
+#property description "when floating profit hits the daily $ target, flat at EOD."
 
 #include <Trade/Trade.mqh>
 
@@ -27,7 +27,7 @@ input bool            InpIntrabar         = true;                   // React to 
 input bool            InpCloseOnOpposite  = true;                   // Close position on opposite cross
 
 input group "=== Daily profit booking ==="
-input double          InpDailyTarget      = 1200.0;                 // Daily profit target ($): book & stop
+input double          InpDailyTarget      = 1200.0;                 // Floating profit ($) at which ALL trades are booked
 input bool            InpFlattenAtEOD     = true;                   // Close everything at end of day
 input int             InpFlattenHour      = 22;                     // End-of-day flatten hour (server time)
 
@@ -39,10 +39,10 @@ input double          InpMaxLot           = 2.0;                    // Hard cap 
 input bool            InpReenterInTrend   = true;                   // Re-enter after TP/SL while trend persists
 input bool            InpDailyLotReset    = true;                   // Restart lot sequence each day
 
-input group "=== Exits ==="
-input int             InpATRPeriod        = 14;                     // ATR period (stop-loss sizing)
-input double          InpATRMultSL        = 1.5;                    // Stop loss = ATR x this
-input double          InpRewardRisk       = 2.0;                    // Take profit = SL distance x this
+input group "=== Optional per-trade exits (0 = disabled) ==="
+input int             InpATRPeriod        = 14;                     // ATR period
+input double          InpATRMultSL        = 0.0;                    // Stop loss in ATR multiples (0 = no SL)
+input double          InpATRMultTP        = 0.0;                    // Take profit in ATR multiples (0 = no TP)
 input int             InpMaxTotalPos      = 3;                      // Max open positions across all symbols
 
 input group "=== Session / misc ==="
@@ -64,9 +64,8 @@ double   g_lastLot[];    // last opened lot per symbol (progression state)
 int      g_lastDir[];    // last trade direction per symbol (+1/-1, 0 = none)
 datetime g_entryBar[];   // bar of last entry per symbol (re-entry throttle)
 
-double   g_dayStartEquity = 0.0;
-datetime g_dayStamp       = 0;   // server midnight of the current trading day
-bool     g_bookedToday    = false;
+datetime g_dayStamp    = 0;      // server midnight of the current trading day
+bool     g_bookedToday = false;  // daily target reached: no more trading today
 bool     g_restartLock    = false; // positions found at startup: manage only, no new trades
 
 string GVName(const string suffix) { return "DPEA_" + (string)InpMagic + "_" + suffix; }
@@ -161,27 +160,27 @@ void OnTick()  { DoWork(); }
 void OnTimer() { DoWork(); }
 
 //+------------------------------------------------------------------+
-//| Snapshot day-start equity; survives EA/terminal restarts via     |
-//| global variables so the daily target is measured from the real   |
-//| start of the day, not from the moment of the restart.            |
+//| Roll the trading day. The booked flag survives EA/terminal       |
+//| restarts via a global variable so a restart after booking cannot |
+//| restart trading on the same day.                                 |
 //+------------------------------------------------------------------+
 void StartOrRestoreDay()
 {
-   datetime today = TimeCurrent() - TimeCurrent() % 86400;
-   if(GlobalVariableCheck(GVName("date")) &&
-      (datetime)(long)GlobalVariableGet(GVName("date")) == today &&
-      GlobalVariableCheck(GVName("equity")))
+   datetime today   = TimeCurrent() - TimeCurrent() % 86400;
+   bool     sameDay = GlobalVariableCheck(GVName("date")) &&
+                      (datetime)(long)GlobalVariableGet(GVName("date")) == today;
+   if(sameDay)
    {
-      g_dayStartEquity = GlobalVariableGet(GVName("equity"));
+      g_bookedToday = GlobalVariableCheck(GVName("booked")) &&
+                      GlobalVariableGet(GVName("booked")) > 0.0;
    }
    else
    {
-      g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       GlobalVariableSet(GVName("date"), (double)(long)today);
-      GlobalVariableSet(GVName("equity"), g_dayStartEquity);
+      GlobalVariableSet(GVName("booked"), 0.0);
+      g_bookedToday = false;
    }
-   g_dayStamp    = today;
-   g_bookedToday = false;
+   g_dayStamp = today;
 
    if(InpDailyLotReset)
       for(int i = 0; i < g_count; i++)
@@ -198,19 +197,18 @@ void DoWork()
    if(today != g_dayStamp)
       StartOrRestoreDay();
 
-   double dayPL  = AccountInfoDouble(ACCOUNT_EQUITY) - g_dayStartEquity;
-   bool   halted = (dayPL >= InpDailyTarget);
-
-   if(halted && CountOurPositions() > 0)
+   double floatPL = FloatingPL();
+   if(!g_bookedToday && floatPL >= InpDailyTarget)
    {
-      CloseAll();
-      if(!g_bookedToday)
-      {
-         g_bookedToday = true;
-         PrintFormat("DailyProfitEMA: daily profit target hit (%.2f). All positions closed, trading halted until tomorrow.",
-                     dayPL);
-      }
+      g_bookedToday = true;
+      GlobalVariableSet(GVName("booked"), 1.0);
+      PrintFormat("DailyProfitEMA: floating profit target hit (%.2f). Booking all trades, halted until tomorrow.",
+                  floatPL);
    }
+   if(g_bookedToday && CountOurPositions() > 0)
+      CloseAll();   // retried every tick until everything is flat
+
+   bool halted = g_bookedToday;
 
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
@@ -279,8 +277,8 @@ void ProcessSymbol(const int i, const bool canOpen)
    }
 
    // No cross this tick. If a previous trade in the trend direction was
-   // closed by TP/SL and the trend still holds, re-enter with a gradually
-   // increased lot (at most one entry per H1 bar per symbol).
+   // closed (optional TP/SL, or manually) and the trend still holds,
+   // re-enter with a gradually increased lot (one entry per bar max).
    if(!InpReenterInTrend || !canOpen)
       return;
    if(rel == 0 || g_lastDir[i] != rel)
@@ -301,14 +299,6 @@ void OpenTrade(const int i, const int dir)
 {
    string s = g_sym[i];
 
-   double atr[];
-   ArraySetAsSeries(atr, true);
-   if(CopyBuffer(g_hATR[i], 0, 0, 2, atr) < 2)
-      return;
-   double slDist = atr[1] * InpATRMultSL;   // ATR of the last closed bar
-   if(slDist <= 0.0)
-      return;
-
    double lots = NextLot(i, dir);
    if(lots <= 0.0)
       return;
@@ -317,11 +307,23 @@ void OpenTrade(const int i, const int dir)
    double ask    = SymbolInfoDouble(s, SYMBOL_ASK);
    double bid    = SymbolInfoDouble(s, SYMBOL_BID);
    double price  = (dir == 1) ? ask : bid;
-   double sl     = (dir == 1) ? price - slDist : price + slDist;
-   double tp     = (dir == 1) ? price + slDist * InpRewardRisk
-                              : price - slDist * InpRewardRisk;
-   sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
+
+   double sl = 0.0, tp = 0.0;   // 0 = order placed without SL/TP
+   if(InpATRMultSL > 0.0 || InpATRMultTP > 0.0)
+   {
+      double atr[];
+      ArraySetAsSeries(atr, true);
+      if(CopyBuffer(g_hATR[i], 0, 0, 2, atr) < 2)
+         return;
+      if(atr[1] <= 0.0)
+         return;
+      if(InpATRMultSL > 0.0)
+         sl = NormalizeDouble((dir == 1) ? price - atr[1] * InpATRMultSL
+                                         : price + atr[1] * InpATRMultSL, digits);
+      if(InpATRMultTP > 0.0)
+         tp = NormalizeDouble((dir == 1) ? price + atr[1] * InpATRMultTP
+                                         : price - atr[1] * InpATRMultTP, digits);
+   }
 
    bool ok = (dir == 1)
              ? g_trade.Buy(lots, s, 0.0, sl, tp, "EMA 21x55 up")
@@ -368,6 +370,21 @@ double NextLot(const int i, const int dir)
    if(lot > maxL)
       lot = maxL;
    return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Combined floating P/L of this EA's open positions                |
+//+------------------------------------------------------------------+
+double FloatingPL()
+{
+   double pl = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong t = PositionGetTicket(i);
+      if(t > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic)
+         pl += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   }
+   return pl;
 }
 
 //+------------------------------------------------------------------+
