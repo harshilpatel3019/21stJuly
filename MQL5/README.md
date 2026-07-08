@@ -36,6 +36,12 @@ The day-start equity snapshot is persisted in terminal global variables, so a
 terminal or EA restart mid-day does **not** reset the daily profit/loss
 tracking.
 
+**Restart safety:** if the terminal or EA is restarted while trades are still
+open, the EA goes into manage-only mode — it keeps handling exits (SL/TP,
+opposite cross, daily target, end-of-day flatten) but opens **no new trades**
+until every existing position is closed. This prevents stacking fresh entries
+on top of an in-flight cycle whose lot-sequence state was lost in the restart.
+
 ## Installation
 
 1. Open MetaEditor (F4 from MT5), copy `Experts/DailyProfitEMA.mq5` into your

@@ -67,6 +67,7 @@ datetime g_entryBar[];   // bar of last entry per symbol (re-entry throttle)
 double   g_dayStartEquity = 0.0;
 datetime g_dayStamp       = 0;   // server midnight of the current trading day
 bool     g_bookedToday    = false;
+bool     g_restartLock    = false; // positions found at startup: manage only, no new trades
 
 string GVName(const string suffix) { return "DPEA_" + (string)InpMagic + "_" + suffix; }
 
@@ -131,6 +132,13 @@ int OnInit()
 
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(20);
+
+   // After a terminal/EA restart the lot-sequence state is lost, so if
+   // trades are still open, only manage them — do not stack new entries
+   // on top. The lock clears once all existing positions are closed.
+   g_restartLock = (CountOurPositions() > 0);
+   if(g_restartLock)
+      Print("DailyProfitEMA: existing positions found at startup; new entries locked until they are closed.");
 
    StartOrRestoreDay();
    EventSetTimer(1);   // evaluate all symbols even when the chart symbol is quiet
@@ -210,8 +218,14 @@ void DoWork()
    if(eod && CountOurPositions() > 0)
       CloseAll();
 
+   if(g_restartLock && CountOurPositions() == 0)
+   {
+      g_restartLock = false;
+      Print("DailyProfitEMA: startup positions closed; new entries unlocked.");
+   }
+
    bool inSession = !InpUseSession || (dt.hour >= InpSessionStart && dt.hour < InpSessionEnd);
-   bool canOpen   = !halted && !eod && inSession;
+   bool canOpen   = !halted && !eod && inSession && !g_restartLock;
 
    for(int i = 0; i < g_count; i++)
       ProcessSymbol(i, canOpen);
