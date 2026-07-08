@@ -18,10 +18,11 @@ pair you want; it trades that chart's symbol). It runs self-contained
    Trades continuing the same direction reuse the current running lot.
    (Broker volume steps apply: with a 0.01-lot step, 0.015 rounds to 0.02 on
    the order, but the internal sequence keeps compounding exactly.)
-4. **Basket take-profit** — no per-trade SL or TP. When the **combined
-   floating P/L** of the cycle reaches **+$1,200**, ALL positions are closed
-   and the EA waits for the next band entry. No lot cap by default
-   (`InpMaxLot` = 0), no trend filter.
+4. **Daily profit booking** — no per-trade SL or TP. When the **day's total
+   P/L** (profit already realized today **plus** current floating P/L)
+   reaches **+$1,200**, ALL positions are closed, the profit is booked and
+   trading halts until the next day. No lot cap by default (`InpMaxLot` = 0),
+   no trend filter.
 5. **Intraday** — everything is flattened at end of day (default 22:00
    server time) and no new cycle is seeded at/after 20:00, so nothing is
    held overnight.
@@ -32,7 +33,10 @@ Cycle state (running lot, last grid direction, last band price) is persisted
 in terminal global variables. Restarting MT5 or re-attaching the EA
 **resumes the running cycle** where it left off. If open positions are found
 but the saved state is missing, the EA switches to **manage-only** mode — it
-still books the basket at the target but places no new trades until flat.
+still books at the daily target but places no new trades until flat. The
+daily "booked" flag also survives restarts, and realized day P/L is read
+from the deal history, so a restart cannot re-trade a day whose target was
+already reached.
 
 ## Installation
 
@@ -54,7 +58,7 @@ still books the basket at the target but places no new trades until flat.
 | `InpGridUSD` | 2.0 | Grid step as $ of P/L per seed lot ($2 on 0.01 EURUSD = 20 pips) |
 | `InpFlipMult` | 1.5 | Running-lot multiplier on each direction flip |
 | `InpMaxLot` | 0 | Lot cap per trade (0 = none, per spec) |
-| `InpBasketTP` | 1200 | Floating P/L ($) at which the whole cycle is booked |
+| `InpDailyTarget` | 1200 | Day P/L ($, realized + floating) at which everything is booked and trading stops for the day |
 | `InpFlattenAtEOD` / `InpFlattenHour` | true / 22 | End-of-day close-all (intraday operation) |
 | `InpSeedEndHour` | 20 | No new cycles seeded at/after this hour |
 | `InpMagic` | 21550708 | Magic number (EA only touches its own trades on its own symbol) |
@@ -74,13 +78,13 @@ the ranges.
   lot by 1.5; a long choppy range flips constantly (×1.5¹⁰ ≈ ×57, ×1.5²⁰ ≈
   ×3,325 of the seed lot). With **no SL, no lot cap and no loss limit**, the
   only hard floor is the broker's margin call.
-- **The $1,200 basket target is far away from a 0.01 seed — especially
+- **The $1,200 daily target is far away from a 0.01 seed — especially
   intraday.** A clean 200-pip one-way run with 20-pip grid adds earns on the
-  order of tens of dollars, not $1,200, and a cycle now only lives until the
-  end-of-day flatten. Expect most days to end with the basket closed at
-  whatever its floating P/L happens to be (often negative in ranges) rather
-  than at the target. Consider testing smaller basket targets (e.g. $12–$50
-  per 0.01 seed) or a larger seed lot, and scale from what the tester shows.
+  order of tens of dollars, not $1,200, and cycles only live until the
+  end-of-day flatten. Expect most days to end at the 22:00 flatten P/L
+  (often negative in ranges) rather than at the target. Consider testing a
+  smaller daily target (e.g. $12–$50 per 0.01 seed) or a larger seed lot,
+  and scale from what the tester shows.
 - **The end-of-day flatten *realises* the cycle's floating P/L.** Intraday
   operation caps overnight risk, but it also converts every unfinished
   cycle's drawdown into a booked loss at 22:00 — watch the daily P/L

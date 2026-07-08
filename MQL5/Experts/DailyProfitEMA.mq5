@@ -12,9 +12,9 @@
 //|  3. SIZING: a running lot starts at the seed lot; every time the |
 //|     grid direction flips it grows x1.5; same-direction trades    |
 //|     reuse the current running lot (0.01 -> 0.015 -> 0.0225 ...). |
-//|  4. EXIT: no per-trade SL/TP. When the combined floating P/L of  |
-//|     the cycle reaches the basket target, ALL positions close and |
-//|     the EA waits for the next band entry.                        |
+//|  4. EXIT: no per-trade SL/TP. When the DAY's total P/L (realized |
+//|     today + floating) reaches +$1200, ALL positions close, the   |
+//|     profit is booked and trading halts until the next day.      |
 //|  5. INTRADAY: everything is flattened at end of day and no new   |
 //|     cycle is seeded in the late session; nothing held overnight. |
 //|                                                                  |
@@ -23,11 +23,12 @@
 //|  state is missing, the EA manages exits only (no new trades)     |
 //|  until flat.                                                     |
 //+------------------------------------------------------------------+
-#property version     "2.10"
+#property version     "2.20"
 #property description "Seeds 1 BUY + 1 SELL when an H1 candle closes with its"
 #property description "open/close between EMA21 and EMA55. Grid-adds with the"
-#property description "move every fixed $ step, running lot x1.5 on each flip,"
-#property description "books ALL trades at the basket floating-profit target."
+#property description "move every fixed $ step, running lot x1.5 on each flip."
+#property description "Books ALL trades when the day's P/L reaches the daily"
+#property description "target, then halts until the next day."
 
 #include <Trade/Trade.mqh>
 
@@ -45,8 +46,8 @@ input double          InpGridUSD        = 2.0;       // Grid step: $ P/L move pe
 input double          InpFlipMult       = 1.5;       // Running-lot multiplier on direction flip
 input double          InpMaxLot         = 0.0;       // Lot cap (0 = none)
 
-input group "=== Basket exit ==="
-input double          InpBasketTP       = 1200.0;    // Close ALL at this floating P/L ($)
+input group "=== Daily profit booking ==="
+input double          InpDailyTarget    = 1200.0;    // Day P/L ($, realized+floating): book all & stop
 
 input group "=== Intraday ==="
 input bool            InpFlattenAtEOD   = true;      // Close everything at end of day
@@ -67,8 +68,10 @@ bool     g_cycleActive = false;
 double   g_runningLot  = 0.0;    // unrounded running lot of the sequence
 int      g_lastGridDir = 0;      // +1 last grid trade was BUY, -1 SELL, 0 none yet
 double   g_lastBand    = 0.0;    // price level of the last grid band
-bool     g_booking     = false;  // basket target hit, closing everything
 bool     g_manageOnly  = false;  // positions found at startup without saved state
+
+datetime g_dayStamp    = 0;      // server midnight of the current trading day
+bool     g_bookedToday = false;  // daily target reached: no more trading today
 
 string GVName(const string suffix)
 {
@@ -114,6 +117,7 @@ int OnInit()
    else
       EndCycle();
 
+   StartOrRestoreDay();
    EventSetTimer(1);
    return INIT_SUCCEEDED;
 }
@@ -133,24 +137,33 @@ void OnTimer() { DoWork(); }
 //+------------------------------------------------------------------+
 void DoWork()
 {
+   datetime today = TimeCurrent() - TimeCurrent() % 86400;
+   if(today != g_dayStamp)
+      StartOrRestoreDay();
+
    int positions = CountPositions();
 
-   // Basket take-profit: book everything, then wait for the next seed.
-   if(positions > 0 && !g_booking && FloatingPL() >= InpBasketTP)
+   // Daily profit booking: when the day's total P/L (realized today +
+   // floating) reaches the target, book everything and stop until the
+   // next day.
+   double dayPL = RealizedToday() + FloatingPL();
+   if(!g_bookedToday && dayPL >= InpDailyTarget)
    {
-      g_booking = true;
-      PrintFormat("DailyProfitEMA: basket target hit (%.2f). Booking all trades on %s.",
-                  FloatingPL(), g_symbol);
+      g_bookedToday = true;
+      GlobalVariableSet(GVName("booked"), 1.0);
+      PrintFormat("DailyProfitEMA: daily target hit (day P/L %.2f). Booking all trades on %s, halted until tomorrow.",
+                  dayPL, g_symbol);
    }
-   if(g_booking)
+   if(g_bookedToday)
    {
       if(positions > 0)
       {
          CloseAll();          // retried every tick until flat
          return;
       }
-      EndCycle();
-      positions = 0;
+      if(g_cycleActive)
+         EndCycle();
+      return;                 // done for the day
    }
 
    // Intraday: flatten everything at end of day. Note this realises
@@ -348,11 +361,60 @@ bool LoadCycle()
 void EndCycle()
 {
    g_cycleActive = false;
-   g_booking     = false;
    g_runningLot  = 0.0;
    g_lastGridDir = 0;
    g_lastBand    = 0.0;
    GlobalVariableSet(GVName("active"), 0.0);
+}
+
+//+------------------------------------------------------------------+
+//| Roll the trading day. The booked flag survives EA/terminal       |
+//| restarts via a global variable so a restart after booking cannot |
+//| restart trading on the same day.                                 |
+//+------------------------------------------------------------------+
+void StartOrRestoreDay()
+{
+   datetime today   = TimeCurrent() - TimeCurrent() % 86400;
+   bool     sameDay = GlobalVariableCheck(GVName("date")) &&
+                      (datetime)(long)GlobalVariableGet(GVName("date")) == today;
+   if(sameDay)
+   {
+      g_bookedToday = GlobalVariableCheck(GVName("booked")) &&
+                      GlobalVariableGet(GVName("booked")) > 0.0;
+   }
+   else
+   {
+      GlobalVariableSet(GVName("date"), (double)(long)today);
+      GlobalVariableSet(GVName("booked"), 0.0);
+      g_bookedToday = false;
+   }
+   g_dayStamp = today;
+}
+
+//+------------------------------------------------------------------+
+//| Realized P/L of this instance's trades closed since server       |
+//| midnight (profit + swap of closing deals, commission of all).    |
+//+------------------------------------------------------------------+
+double RealizedToday()
+{
+   if(!HistorySelect(g_dayStamp, TimeCurrent() + 60))
+      return 0.0;
+   double pl = 0.0;
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong t = HistoryDealGetTicket(i);
+      if(t == 0)
+         continue;
+      if(HistoryDealGetInteger(t, DEAL_MAGIC) != InpMagic)
+         continue;
+      if(HistoryDealGetString(t, DEAL_SYMBOL) != g_symbol)
+         continue;
+      pl += HistoryDealGetDouble(t, DEAL_COMMISSION);
+      ENUM_DEAL_ENTRY e = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(t, DEAL_ENTRY);
+      if(e == DEAL_ENTRY_OUT || e == DEAL_ENTRY_INOUT || e == DEAL_ENTRY_OUT_BY)
+         pl += HistoryDealGetDouble(t, DEAL_PROFIT) + HistoryDealGetDouble(t, DEAL_SWAP);
+   }
+   return pl;
 }
 
 //+------------------------------------------------------------------+
