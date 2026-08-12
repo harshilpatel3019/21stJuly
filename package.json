@@ -1,0 +1,28 @@
+{
+  "name": "tradingview-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server exposing TradingView market data tools (symbol search, quotes, screener, top movers)",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "tradingview-mcp-server": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "tradingview",
+    "stocks",
+    "market-data"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  }
+}
